@@ -1,0 +1,650 @@
+---
+title: "H2 Single Layer MLP"
+author: "Bankbintje"
+date: "22 februari 2016"
+output: pdf_document
+---
+# Data
+
+## Load Data & Packages
+
+Required packages worden geladen. Aanname is dat deze al voorkomen.
+```{r load packages}
+library(neuralnet)
+library(nnet)        
+library(plyr)        
+```
+
+Install package "MixAll" en laad de dataset "DebTrivedi". Check # rijen en kolommen. Beschrijving kolommen:
+
+* ofp (number of physician office visits)
+* hosp (number of hospital stays) 
+* health (self-perceived health status)
+* numchron (number of chronic conditions)
+* gender
+* school (number of years of education)
+* privins (private insurance indicator)
+
+```{r Load DebTrivediData}
+##install.packages("MixAll")
+data("DebTrivedi", package="MixAll")
+data<-DebTrivedi
+nrow(data)
+ncol(data)
+```
+
+Verwijder data met NA's, check # rijen en kolommen.
+```{r "Remove NA's"}
+data<-na.omit(data)
+nrow(data)
+ncol(data)
+```
+
+\pagebreak
+
+## Explore Data
+
+```{r Plot ofp}
+plot(table(data$ofp), xlab= "Number of physician office visits (ofp)", ylab="Frequency")
+```
+
+Doel is om NN te gebruiken om te voorspellen of een individu hoger of lager dan gemiddeld aantal "office visits" heeft. Daarom een variabele toevoegen die waarde -1 heeft als het aantal ofp's lager is dan de mediaan en 1 als deze hoger is dan de mediaan.
+
+```{r Set Class variable}
+data$Class<- ifelse(DebTrivedi$ofp>=median(DebTrivedi$ofp),-1,1)
+```
+Check de verdeling
+```{r barplot Class}
+barplot(table(data$Class), ylab = "Frequency")
+```
+
+Gebruik cfac function om relatie te tonen tussen "Class" en de covariates
+1. hosp
+2. health
+3. numchron
+4. gender
+5. school
+6. privins
+
+uit https://cran.r-project.org/web/packages/pscl/vignettes/countreg.pdf
+```{r cfac function}
+cfac <- function (x, breaks = NULL){
+if(is.null(breaks)) breaks <- unique(quantile(x, 0:10/10))
+x <- cut(x,breaks,include.lowest=TRUE, right=FALSE)
+levels(x) <- paste(breaks[-length(breaks)], ifelse(diff(breaks)>1,
+c(paste("-", breaks[-c(1, length(breaks))] -1, sep = ""), "+"), ""),
+sep = "") + return(x)}
+```
+
+Plot de data
+```{r plot}
+par (mfrow = c(3,2))
+plot (Class ~ cfac(hosp), data = data, xlab = "Number of hospital stays (hosp)")
+plot (Class ~ cfac(numchron), data = data, xlab = "Number of chronic conditions (numchron)")
+plot (Class ~ cfac(school), data = data, xlab = "Number of years of education (school)")
+plot (Class ~ health, data = data)
+plot (Class ~ gender, data = data)
+plot (Class ~ privins, data = data, xlab = "Private Insurance (privins)")
+```
+
+\pagebreak
+
+## Prepare Data
+Converteer gender, privins en health naar numerieke variabelen.
+
+```{r prepare data}
+levels(data$gender)<- c("-1","1")
+data$gender<- as.numeric(as.character(data$gender))
+
+levels(data$privins)<- c("-1","1")
+data$privins<- as.numeric(as.character(data$privins))
+
+levels(data$health)<- c("0","1","2")
+data$health<- as.numeric(as.character(data$health))
+```
+
+Converteer overige variabelen naar numeriek
+
+```{r convert variables}
+data$hosp <- as.numeric(as.character(data$hosp))
+data$numchron <- as.numeric(as.character(data$numchron))
+data$school <- as.numeric(as.character(data$school))
+```
+
+Selecteer alleen relevante variabelen
+```{r select variables}
+keeps<-c("Class", "hosp", "health", "numchron", "gender", "school", "privins")
+data<-data[keeps]
+head(data)
+```
+
+Centreer data:  subtract the mean of all data points from each individual data point.
+```{r center data}
+head(scale(data, center = TRUE, scale = FALSE))
+```
+
+Standardiseer (center & scale) de data met scale: subtract the mean of all data points from each individual data point, then divide those points by the standard deviation of all points.
+```{r cente and scale data}
+data<-scale(data)
+head(data)
+```
+
+\pagebreak
+
+## Correlation Plots
+
+Maak een standaard corrplot van de dataset
+```{r corrplot}
+library(corrplot)
+corrplot(cor(data))
+```
+
+Functie voor het bepalen van correlatie & significantie
+```{r function cor.mtest}
+cor.mtest <- function(mat, conf.level = 0.95) {
+    mat <- as.matrix(mat)
+    n <- ncol(mat)
+    p.mat <- lowCI.mat <- uppCI.mat <- matrix(NA, n, n)
+    diag(p.mat) <- 0
+    diag(lowCI.mat) <- diag(uppCI.mat) <- 1
+    for (i in 1:(n - 1)) {
+        for (j in (i + 1):n) {
+            tmp <- cor.test(mat[, i], mat[, j], conf.level = conf.level)
+            p.mat[i, j] <- p.mat[j, i] <- tmp$p.value
+            lowCI.mat[i, j] <- lowCI.mat[j, i] <- tmp$conf.int[1]
+            uppCI.mat[i, j] <- uppCI.mat[j, i] <- tmp$conf.int[2]
+        }
+    }
+    return(list(p.mat, lowCI.mat, uppCI.mat))
+}
+```
+
+Verschillende manieren om correlatie te plotten. Zie: https://cran.r-project.org/web/packages/corrplot/vignettes/corrplot-intro.html
+
+```{r corrplot 2}
+res<-cor.mtest(data)
+## add p-values on no significant coefficient
+corrplot(cor(data), p.mat = res[[1]], sig.level = 0.1,insig="p-value")
+## add all p-values
+corrplot(cor(data), p.mat = res[[1]], sig.level = -1,insig="p-value")
+```
+
+\pagebreak
+
+# Neural Network
+
+## Preparations
+Schrijf de formule eerst als variabele:
+```{r define formula}
+f<-Class ~ hosp + health + numchron + gender + school + privins
+# seed
+set.seed(103)
+n=nrow(data)
+# selecteer trainingset
+train <- sample(1:n, 4000, FALSE)
+```     
+
+## Estimate the model
+
+Maak een MLP met een hidden layer
+```{r fit data }
+fit <- neuralnet(f, data = data[train,], hidden = 1, algorithm = "rprop+",
+                 err.fct = "sse", act.fct = "logistic",
+                 linear.output = FALSE)
+```
+
+* hidden = nbr of hidden layers
+
+* algorithm = "rprop+" = resilient backpropagation with backtracking
+
+* algorithm = "backprop" = traditional backpropagation, needs learning rate
+
+* learningrate = 0.01
+
+* err.fct = error function: sum squared errors ("sse"") or cross-entropy ("ce")
+
+* act.fct = type of activation function
+
+* linear.output = if set to "TRUE" the node's output is not transformed by the specified activation function ; it is in essence linear
+
+\pagebreak
+
+## Results
+```{r Results}
+print(fit)
+```
+The model converged after 15.376 steps with an error of 1874.
+
+
+https://groups.google.com/forum/#!topic/rropen/qS7Fki9pj8k
+```{r plotnn}
+plotnn <- function (x, rep = NULL, x.entry = NULL, x.out = NULL, radius = 0.15, 
+  arrow.length = 0.2, intercept = TRUE, intercept.factor = 0.4, 
+  information = TRUE, information.pos = 0.1, col.entry.synapse = "black", 
+  col.entry = "black", col.hidden = "black", col.hidden.synapse = "black", 
+  col.out = "black", col.out.synapse = "black", col.intercept = "blue", 
+  fontsize = 12, dimension = 6, show.weights = TRUE, file = NULL, 
+  ...) 
+{
+  net <- x
+  if (is.null(net$weights)) 
+    stop("weights were not calculated")
+  if (!is.null(file) && !is.character(file)) 
+    stop("'file' must be a string")
+  if (is.null(rep)) {
+    for (i in 1:length(net$weights)) {
+      if (!is.null(file)) 
+        file.rep <- paste(file, ".", i, sep = "")
+      else file.rep <- NULL
+      # dev.new()
+      plot.nn(net, rep = i, x.entry, x.out, radius, arrow.length, 
+        intercept, intercept.factor, information, information.pos, 
+        col.entry.synapse, col.entry, col.hidden, col.hidden.synapse, 
+        col.out, col.out.synapse, col.intercept, fontsize, 
+        dimension, show.weights, file.rep, ...)
+    }
+  }
+  else {
+    if (is.character(file) && file.exists(file)) 
+      stop(sprintf("%s already exists", sQuote(file)))
+    result.matrix <- t(net$result.matrix)
+    if (rep == "best") 
+      rep <- as.integer(which.min(result.matrix[, "error"]))
+    if (rep > length(net$weights)) 
+      stop("'rep' does not exist")
+    weights <- net$weights[[rep]]
+    if (is.null(x.entry)) 
+      x.entry <- 0.5 - (arrow.length/2) * length(weights)
+    if (is.null(x.out)) 
+      x.out <- 0.5 + (arrow.length/2) * length(weights)
+    width <- max(x.out - x.entry + 0.2, 0.8) * 8
+    radius <- radius/dimension
+    entry.label <- net$model.list$variables
+    out.label <- net$model.list$response
+    neuron.count <- array(0, length(weights) + 1)
+    neuron.count[1] <- nrow(weights[[1]]) - 1
+    neuron.count[2] <- ncol(weights[[1]])
+    x.position <- array(0, length(weights) + 1)
+    x.position[1] <- x.entry
+    x.position[length(weights) + 1] <- x.out
+    if (length(weights) > 1) 
+      for (i in 2:length(weights)) {
+        neuron.count[i + 1] <- ncol(weights[[i]])
+        x.position[i] <- x.entry + (i - 1) * (x.out - 
+          x.entry)/length(weights)
+      }
+    y.step <- 1/(neuron.count + 1)
+    y.position <- array(0, length(weights) + 1)
+    y.intercept <- 1 - 2 * radius
+    information.pos <- min(min(y.step) - 0.1, 0.2)
+    if (length(entry.label) != neuron.count[1]) {
+      if (length(entry.label) < neuron.count[1]) {
+        tmp <- NULL
+        for (i in 1:(neuron.count[1] - length(entry.label))) {
+          tmp <- c(tmp, "no name")
+        }
+        entry.label <- c(entry.label, tmp)
+      }
+    }
+    if (length(out.label) != neuron.count[length(neuron.count)]) {
+      if (length(out.label) < neuron.count[length(neuron.count)]) {
+        tmp <- NULL
+        for (i in 1:(neuron.count[length(neuron.count)] - 
+          length(out.label))) {
+          tmp <- c(tmp, "no name")
+        }
+        out.label <- c(out.label, tmp)
+      }
+    }
+    grid.newpage()
+    for (k in 1:length(weights)) {
+      for (i in 1:neuron.count[k]) {
+        y.position[k] <- y.position[k] + y.step[k]
+        y.tmp <- 0
+        for (j in 1:neuron.count[k + 1]) {
+          y.tmp <- y.tmp + y.step[k + 1]
+          result <- calculate.delta(c(x.position[k], 
+            x.position[k + 1]), c(y.position[k], y.tmp), 
+            radius)
+          x <- c(x.position[k], x.position[k + 1] - 
+            result[1])
+          y <- c(y.position[k], y.tmp + result[2])
+          grid.lines(x = x, y = y, arrow = arrow(length = unit(0.15, 
+            "cm"), type = "closed"), gp = gpar(fill = col.hidden.synapse, 
+            col = col.hidden.synapse, ...))
+          if (show.weights) 
+            draw.text(label = weights[[k]][neuron.count[k] - 
+              i + 2, neuron.count[k + 1] - j + 1], x = c(x.position[k], 
+              x.position[k + 1]), y = c(y.position[k], 
+              y.tmp), xy.null = 1.25 * result, color = col.hidden.synapse, 
+              fontsize = fontsize - 2, ...)
+        }
+        if (k == 1) {
+          grid.lines(x = c((x.position[1] - arrow.length), 
+            x.position[1] - radius), y = y.position[k], 
+            arrow = arrow(length = unit(0.15, "cm"), 
+              type = "closed"), gp = gpar(fill = col.entry.synapse, 
+              col = col.entry.synapse, ...))
+          draw.text(label = entry.label[(neuron.count[1] + 
+            1) - i], x = c((x.position - arrow.length), 
+            x.position[1] - radius), y = c(y.position[k], 
+            y.position[k]), xy.null = c(0, 0), color = col.entry.synapse, 
+            fontsize = fontsize, ...)
+          grid.circle(x = x.position[k], y = y.position[k], 
+            r = radius, gp = gpar(fill = "white", col = col.entry, 
+              ...))
+        }
+        else {
+          grid.circle(x = x.position[k], y = y.position[k], 
+            r = radius, gp = gpar(fill = "white", col = col.hidden, 
+              ...))
+        }
+      }
+    }
+    out <- length(neuron.count)
+    for (i in 1:neuron.count[out]) {
+      y.position[out] <- y.position[out] + y.step[out]
+      grid.lines(x = c(x.position[out] + radius, x.position[out] + 
+        arrow.length), y = y.position[out], arrow = arrow(length = unit(0.15, 
+        "cm"), type = "closed"), gp = gpar(fill = col.out.synapse, 
+        col = col.out.synapse, ...))
+      draw.text(label = out.label[(neuron.count[out] + 
+        1) - i], x = c((x.position[out] + radius), x.position[out] + 
+        arrow.length), y = c(y.position[out], y.position[out]), 
+        xy.null = c(0, 0), color = col.out.synapse, 
+        fontsize = fontsize, ...)
+      grid.circle(x = x.position[out], y = y.position[out], 
+        r = radius, gp = gpar(fill = "white", col = col.out, 
+          ...))
+    }
+    if (intercept) {
+      for (k in 1:length(weights)) {
+        y.tmp <- 0
+        x.intercept <- (x.position[k + 1] - x.position[k]) * 
+          intercept.factor + x.position[k]
+        for (i in 1:neuron.count[k + 1]) {
+          y.tmp <- y.tmp + y.step[k + 1]
+          result <- calculate.delta(c(x.intercept, x.position[k + 
+            1]), c(y.intercept, y.tmp), radius)
+          x <- c(x.intercept, x.position[k + 1] - result[1])
+          y <- c(y.intercept, y.tmp + result[2])
+          grid.lines(x = x, y = y, arrow = arrow(length = unit(0.15, 
+            "cm"), type = "closed"), gp = gpar(fill = col.intercept, 
+            col = col.intercept, ...))
+          xy.null <- cbind(x.position[k + 1] - x.intercept - 
+            2 * result[1], -(y.tmp - y.intercept + 2 * 
+            result[2]))
+          if (show.weights) 
+            draw.text(label = weights[[k]][1, neuron.count[k + 
+              1] - i + 1], x = c(x.intercept, x.position[k + 
+              1]), y = c(y.intercept, y.tmp), xy.null = xy.null, 
+              color = col.intercept, alignment = c("right", 
+                "bottom"), fontsize = fontsize - 2, 
+              ...)
+        }
+        grid.circle(x = x.intercept, y = y.intercept, 
+          r = radius, gp = gpar(fill = "white", col = col.intercept, 
+            ...))
+        grid.text(1, x = x.intercept, y = y.intercept, 
+          gp = gpar(col = col.intercept, ...))
+      }
+    }
+    if (information) 
+      grid.text(paste("Error: ", round(result.matrix[rep, 
+        "error"], 6), "   Steps: ", result.matrix[rep, 
+        "steps"], sep = ""), x = 0.5, y = information.pos, 
+        just = "bottom", gp = gpar(fontsize = fontsize + 
+          2, ...))
+    if (!is.null(file)) {
+      weight.plot <- recordPlot()
+      save(weight.plot, file = file)
+    }
+  }
+}
+```
+
+Simple plot, intercept & weights are turned off.
+```{r Plot MLP}
+##par (mfrow = c(1,1))
+plotnn(fit, intercept = FALSE, show.weights = FALSE)
+```
+
+To see what ```fit``` actually contains, run:
+```{r attributes fit}
+attributes(fit)
+```
+
+To check details of a particular attribute, use the ```$``` operator. For example, check the summary of the fitted network contained in ```result.matrix```:
+```{r result matrix}
+fit$result.matrix
+```
+The value goven for ```hosp.to.1layhid1``` is the calculated optimum weight of the synapse between ```hosp``` and the hidden neuron.
+
+\pagebreak
+
+## Predicting new cases
+
+Method ```compute``` from the neuralnet package computes the output of all neurons given a trained neural network using (the same!) covariate vectors.
+```{r predict}
+pred<-compute(fit, data[-train, 2:7])
+```
+View the first few predictions from $net.result
+
+```{r show prediction}
+## show attributes in pred
+attributes(pred)
+## get top results
+head(pred$net.result)
+```
+These numbers give the probability of an individual belonging to the below median or above median. Let's convert them back to the same -1, +1 scale as used in ```Class```.
+```{r convert back Class}
+r2 <- ifelse(pred$net.result<=0.5,-1,1)
+head(r2)
+```
+
+\pagebreak
+
+## Check Results
+
+Build a confusion matrix:
+```{r confusion matrix}
+table(sign(r2), sign(data[-train,1]), dnn=c("Predicted", "Observed"))
+```
+Of the 406 observations 205 were correctlt classified as belonging to group -1, and 33 were correctly classified as belonging to group +1. The error rate is calculated measuring the misclassified observations as proportion of the total:
+```{r error rate}
+error_rate = (1- sum(sign(r2)==sign(data[-train,1]))/length(data[-train,1]))
+round(error_rate, 2)
+```
+Overall 41% of individuals were misclassified. This implies a prediction accuray of around 59%.
+
+
+Nog beter: gebruik caret
+```{r caret confusion matrix}
+library(caret)
+confusionMatrix(data=r2,reference = sign(data[-train,1]) )
+```
+
+\pagebreak
+
+# Excercises
+
+## Question 1
+Re-build the model, but this time using six hidden nodes
+Maak een MLP met zes hidden layers
+```{r fit data Q1 }
+set.seed(103)
+fit.q1 <- neuralnet(f, data = data[train,], hidden = 6, algorithm = "rprop+",
+                 err.fct = "sse", act.fct = "logistic",
+                 linear.output = FALSE)
+```
+
+
+### Q1 Results
+```{r Results Q1}
+print(fit.q1)
+```
+The model converged after 3.698 steps with an error of 1829.
+
+Simple plot, intercept & weights are turned off.
+```{r Plot MLP Q1}
+plotnn(fit.q1, intercept = FALSE, show.weights = FALSE)
+```
+
+To check details of a particular attribute, use the ```$``` operator. For example, check the summary of the fitted network contained in ```result.matrix```:
+```{r result matrix Q1}
+fit.q1$result.matrix
+```
+
+### Q1 Predicting new cases
+
+Method ```compute``` from the neuralnet package computes the output of all neurons given a trained neural network using (the same!) covariate vectors.
+```{r predict Q1}
+pred.q1<-compute(fit.q1, data[-train, 2:7])
+```
+These numbers give the probability of an individual belonging to the below median or above median. Let's convert them back to the same -1, +1 scale as used in ```Class```.
+```{r convert back Class Q1}
+r2.q1 <- ifelse(pred.q1$net.result<=0.5,-1,1)
+head(r2.q1)
+```
+### Check Results Q1
+
+Build a confusion matrix:
+```{r confusion matrix Q1}
+table(sign(r2.q1), sign(data[-train,1]), dnn=c("Predicted", "Observed"))
+```
+Of the 406 observations 201 were correctly classified as belonging to group -1, and 35 were correctly classified as belonging to group +1. The error rate is calculated measuring the misclassified observations as proportion of the total:
+```{r error rate Q1}
+error_rate.q1 = (1- sum(sign(r2.q1)==sign(data[-train,1]))/length(data[-train,1]))
+round(error_rate.q1, 2)
+```
+Overall 42% of individuals were misclassified. This implies a prediction accuray of around 58%.
+Nog beter: gebruik caret
+```{r caret confusion matrix Q1}
+library(caret)
+confusionMatrix(data=r2.q1,reference = sign(data[-train,1]) )
+```
+\pagebreak
+
+## Question 2
+Re-estimate the model build in question 1, but using resilient backpropagation without backtracking.
+
+Maak een MLP met zes hidden layers
+```{r fit data Q2 }
+set.seed(103)
+fit.q2 <- neuralnet(f, data = data[train,], hidden = 6, algorithm = "rprop-",
+                 err.fct = "sse", act.fct = "logistic",
+                 linear.output = FALSE)
+```
+
+### Q2 Results
+```{r Results Q2}
+print(fit.q2)
+```
+The model converged after 28.568 steps with an error of 1823.
+
+Simple plot, intercept & weights are turned off.
+```{r Plot MLP Q2}
+plotnn(fit.q2, intercept = FALSE, show.weights = FALSE)
+```
+
+To check details of a particular attribute, use the ```$``` operator. For example, check the summary of the fitted network contained in ```result.matrix```:
+```{r result matrix Q2}
+fit.q2$result.matrix
+```
+
+### Q2 Predicting new cases
+
+Method ```compute``` from the neuralnet package computes the output of all neurons given a trained neural network using (the same!) covariate vectors.
+```{r predict Q2}
+pred.q2<-compute(fit.q2, data[-train, 2:7])
+```
+These numbers give the probability of an individual belonging to the below median or above median. Let's convert them back to the same -1, +1 scale as used in ```Class```.
+```{r convert back Class Q2}
+r2.q2 <- ifelse(pred.q2$net.result<=0.5,-1,1)
+head(r2.q2)
+```
+### Check Results Q2
+
+Build a confusion matrix:
+```{r confusion matrix Q2}
+table(sign(r2.q2), sign(data[-train,1]), dnn=c("Predicted", "Observed"))
+```
+Of the 406 observations 201 were correctly classified as belonging to group -1, and 35 were correctly classified as belonging to group +1. The error rate is calculated measuring the misclassified observations as proportion of the total:
+```{r error rate Q2}
+error_rate.q2 = (1- sum(sign(r2.q2)==sign(data[-train,1]))/length(data[-train,1]))
+round(error_rate.q2, 2)
+```
+Overall 42% of individuals were misclassified. This implies a prediction accuray of around 58%.
+Nog beter: gebruik caret
+```{r caret confusion matrix Q2}
+library(caret)
+confusionMatrix(data=r2.q2,reference = sign(data[-train,1]) )
+```
+
+\pagebreak
+
+## Question 3
+Suppose a domain expert informed you only ```hosp```, ```health``` and ```numchron``` were relevant attributes. Build a model with 2 hidden nodes using resilient backpropagation without backtracking.
+
+Maak nieuwe dataset met alleen de relevante variabelen.
+```{r select variables Q3}
+keeps.q3<-c("Class", "hosp", "health", "numchron")
+data.q3<-data[,keeps.q3]
+head(data.q3)
+```
+
+Maak een nieuwe formule:
+```{r define formula Q3}
+f.q3<-Class ~ hosp + health + numchron
+```     
+Maak een MLP met twee hidden layers
+```{r fit data Q3 }
+set.seed(103)
+fit.q3 <- neuralnet(f.q3, data = data.q3[train,], hidden = 2, 
+                    algorithm = "rprop-", err.fct = "sse", 
+                    act.fct = "logistic", linear.output = FALSE)
+```
+
+### Q3 Results
+```{r Results Q3}
+print(fit.q3)
+```
+The model converged after 1.119 steps with an error of 1878.
+
+Simple plot, intercept & weights are turned off.
+```{r Plot MLP Q3}
+plotnn(fit.q3, intercept = FALSE, show.weights = FALSE)
+```
+
+To check details of a particular attribute, use the ```$``` operator. For example, check the summary of the fitted network contained in ```result.matrix```:
+```{r result matrix Q3}
+fit.q3$result.matrix
+```
+
+### Q3 Predicting new cases
+
+Method ```compute``` from the neuralnet package computes the output of all neurons given a trained neural network using (the same!) covariate vectors.
+```{r predict Q3}
+pred.q3<-compute(fit.q3, data.q3[-train, 2:4])
+```
+These numbers give the probability of an individual belonging to the below median or above median. Let's convert them back to the same -1, +1 scale as used in ```Class```.
+```{r convert back Class Q3}
+r2.q3 <- ifelse(pred.q3$net.result<=0.5,-1,1)
+head(r2.q3)
+```
+### Check Results Q3
+
+Build a confusion matrix:
+```{r confusion matrix Q3}
+table(sign(r2.q3), sign(data.q3[-train,1]), dnn=c("Predicted", "Observed"))
+```
+Of the 406 observations 214 were correctly classified as belonging to group -1, and 12 were correctly classified as belonging to group +1. The error rate is calculated measuring the misclassified observations as proportion of the total:
+```{r error rate Q3}
+error_rate.q3 = (1- sum(sign(r2.q3)==sign(data.q3[-train,1]))/length(data.q3[-train,1]))
+round(error_rate.q3, 2)
+```
+Overall 44% of individuals were misclassified. This implies a prediction accuray of around 56%.
+Nog beter: gebruik caret
+```{r caret confusion matrix Q3}
+library(caret)
+confusionMatrix(data=r2.q3,reference = sign(data.q3[-train,1]) )
